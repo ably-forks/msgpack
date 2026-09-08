@@ -319,3 +319,117 @@ func TestSecHonestWideStructureRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// Test that input nested deeper than the decoder will follow is rejected
+// rather than followed. Each level of nesting is a level of recursion, so
+// without a limit a body of nothing but one-byte array headers grows the
+// goroutine stack until it passes the 1gb a goroutine may have, which is a
+// fatal error that no recover can catch.
+func TestSecNestingDepthIsBounded(t *testing.T) {
+	// a couple of megabytes of headers, which is enough to exhaust the
+	// stack but small enough to be an unremarkable request body
+	data := make([]byte, 2_785_280)
+	for i := range data {
+		data[i] = 0x91 // fixarray of one element: one byte, one level
+	}
+
+	for _, tc := range []struct {
+		name string
+		dst  func() interface{}
+	}{
+		{"interface{}", func() interface{} { return new(interface{}) }},
+		{"[]interface{}", func() interface{} { return new([]interface{}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Unmarshal(data, tc.dst())
+			if err == nil {
+				t.Fatal("expected an error, got none")
+			}
+			t.Logf("%v", err)
+		})
+	}
+}
+
+// Test that nesting a struct decodes to the same depth, since struct fields
+// reach their values by a different route than slice and map elements do.
+func TestSecNestingDepthIsBoundedThroughStructs(t *testing.T) {
+	type node struct {
+		Next interface{} `msgpack:"n"`
+	}
+
+	// {"n": {"n": {"n": ...}}}, one fixmap and one one-byte key per level
+	var data []byte
+	for i := 0; i < maxDepth+1000; i++ {
+		data = append(data, 0x81, 0xa1, 'n')
+	}
+	data = append(data, 0xc0)
+
+	if err := Unmarshal(data, new(node)); err == nil {
+		t.Fatal("expected an error, got none")
+	}
+}
+
+// Test that nesting well within the limit still decodes, so that the limit has
+// not been set somewhere a real payload would reach.
+func TestSecNestingWithinDepthDecodes(t *testing.T) {
+	const depth = 100
+
+	in := interface{}("leaf")
+	for i := 0; i < depth; i++ {
+		in = []interface{}{in}
+	}
+
+	b, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var out interface{}
+	if err := Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for i := 0; i < depth; i++ {
+		s, ok := out.([]interface{})
+		if !ok || len(s) != 1 {
+			t.Fatalf("level %d: expected a one-element slice, got %#v", i, out)
+		}
+		out = s[0]
+	}
+	if out != "leaf" {
+		t.Fatalf("expected the leaf, got %#v", out)
+	}
+}
+
+// Test that a value nested inside a CustomDecoder does not get a fresh
+// allocation allowance. A CustomDecoder is handed the same Decoder and may
+// call Decode again for a field, which must not refill the budget, or a value
+// nested inside enough of them could allocate without limit.
+func TestSecCustomDecoderDoesNotRefillBudget(t *testing.T) {
+	data := secArray32Header(secDeclared)
+
+	var direct, nested uint64
+	func() {
+		var dst []int64
+		direct = secMeasureAlloc(func() { _ = Unmarshal(data, &dst) })
+	}()
+	func() {
+		var dst secNestingCustom
+		nested = secMeasureAlloc(func() { _ = Unmarshal(data, &dst) })
+	}()
+
+	t.Logf("direct=%d bytes, through a CustomDecoder=%d bytes", direct, nested)
+	if nested > secAllocCeiling {
+		t.Fatalf("allocation through a CustomDecoder not bounded: %d bytes (> %d)",
+			nested, secAllocCeiling)
+	}
+}
+
+// secNestingCustom decodes by calling back into Decode, as a CustomDecoder may.
+type secNestingCustom struct {
+	values []int64
+}
+
+func (c *secNestingCustom) DecodeMsgpack(d *Decoder) error {
+	return d.Decode(&c.values)
+}

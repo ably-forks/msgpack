@@ -97,7 +97,11 @@ type Decoder struct {
 
 	// budget is how many more elements may be allocated ahead of the data
 	// for them, for this decode. See initLen.
-	budget    int
+	budget int
+
+	// depth is how many levels of nesting are currently being decoded.
+	// See enter.
+	depth     int
 	structTag string
 	buf       []byte
 	rec       []byte
@@ -159,6 +163,7 @@ func (d *Decoder) ResetReader(r io.Reader) {
 	// ends up using; Buffered counts only what has been read ahead, so it
 	// is a lower bound, which initLen is still safe to clip against.
 	d.budget = -1
+	d.depth = 0
 	d.lenr, d.bufr = nil, nil
 	switch rr := d.r.(type) {
 	case interface{ Len() int }:
@@ -234,8 +239,13 @@ func (d *Decoder) Buffered() io.Reader {
 
 //nolint:gocyclo
 func (d *Decoder) Decode(v interface{}) error {
-	// each value gets its own allowance; see initLen
-	d.budget = -1
+	// Each value gets its own allowance; see initLen. Only the outermost
+	// decode, though: a CustomDecoder is handed the same Decoder and may
+	// call back into Decode for a field, and refilling there would let a
+	// value nested inside enough of them allocate without limit.
+	if d.depth == 0 {
+		d.budget = -1
+	}
 
 	var err error
 	switch v := v.(type) {
@@ -366,15 +376,34 @@ func (d *Decoder) DecodeMulti(v ...interface{}) error {
 }
 
 func (d *Decoder) decodeInterfaceCond() (interface{}, error) {
-	if d.flags&looseInterfaceDecodingFlag != 0 {
-		return d.DecodeInterfaceLoose()
+	if err := d.enter(); err != nil {
+		return nil, err
 	}
-	return d.DecodeInterface()
+
+	var (
+		v   interface{}
+		err error
+	)
+	if d.flags&looseInterfaceDecodingFlag != 0 {
+		v, err = d.DecodeInterfaceLoose()
+	} else {
+		v, err = d.DecodeInterface()
+	}
+
+	d.leave()
+	return v, err
 }
 
 func (d *Decoder) DecodeValue(v reflect.Value) error {
+	if err := d.enter(); err != nil {
+		return err
+	}
+
 	decode := getDecoder(v.Type())
-	return decode(d, v)
+	err := decode(d, v)
+
+	d.leave()
+	return err
 }
 
 func (d *Decoder) DecodeNil() error {
@@ -745,6 +774,36 @@ func (d *Decoder) initLen(n, limit, minBytesPerElem int) int {
 // minInitLen is the smallest collection we will size from the input remaining,
 // below which the clip costs more in reallocation than it saves.
 const minInitLen = 64
+
+// maxDepth is how deeply the input may nest values before decoding gives up.
+//
+// Every level of nesting is a level of recursion, and a container header can
+// be a single byte, so a body of nothing but headers costs a stack frame per
+// byte. At around 512 bytes a frame, 2mb of them exhausts the 1gb a goroutine
+// stack may grow to, which is a fatal error that cannot be recovered.
+//
+// encoding/json stops at the same depth, so input too deeply nested for one
+// format is too deeply nested for the other.
+const maxDepth = 10000
+
+var errNestingTooDeep = fmt.Errorf("msgpack: input nests more than %d levels deep", maxDepth)
+
+// enter records the start of a nested value. If it returns an error the value
+// is too deeply nested to decode and nothing has been recorded, so the caller
+// returns without calling leave; otherwise the caller must call leave once it
+// has finished with the value.
+func (d *Decoder) enter() error {
+	d.depth++
+	if d.depth > maxDepth {
+		d.depth--
+		return errNestingTooDeep
+	}
+	return nil
+}
+
+func (d *Decoder) leave() {
+	d.depth--
+}
 
 // bytesAvailable reports a lower bound on the input still to be read, or -1 if
 // the reader cannot report it at all.
