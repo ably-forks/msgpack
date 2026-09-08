@@ -270,3 +270,52 @@ func TestSecAllocBounded_NestedArrays(t *testing.T) {
 			len(data), got, secAllocCeiling)
 	}
 }
+
+// Test the same for a much longer run of nested array headers. Clipping each
+// collection to the input left is not enough on its own, because every level
+// is clipped against much the same input as the one above it, so the total
+// still grows with the square of the body.
+func TestSecAllocBounded_DeeplyNestedArrays(t *testing.T) {
+	data := []byte{0x9d, 0x00}
+	for i := 0; i < 2456; i++ {
+		data = append(data, 0xdc)
+	}
+
+	var dst interface{}
+	got := secMeasureAlloc(func() { _ = Unmarshal(data, &dst) })
+
+	t.Logf("%d bytes of headers, allocated=%.2f MiB", len(data), float64(got)/(1<<20))
+	if got > secAllocCeiling {
+		t.Fatalf("nested allocation not bounded: %d bytes allocated %d bytes (> %d)",
+			len(data), got, secAllocCeiling)
+	}
+}
+
+// Test that a wide structure, which spends from the same budget a deep nest
+// would, still decodes in full. It has to: every element costs at least a byte
+// to encode, so a body can never hold more elements than the budget allows.
+func TestSecHonestWideStructureRoundTrips(t *testing.T) {
+	in := make([]map[string]int, 2000)
+	for i := range in {
+		in[i] = map[string]int{"a": i, "b": i * 2, "c": i * 3}
+	}
+
+	b, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var out []map[string]int
+	if err := Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(out) != len(in) {
+		t.Fatalf("length mismatch: got %d, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if len(out[i]) != 3 || out[i]["b"] != i*2 {
+			t.Fatalf("entry %d wrong: %v", i, out[i])
+		}
+	}
+}

@@ -92,8 +92,12 @@ type Decoder struct {
 	// bufio.Reader through Buffered. At most one is ever set, and initLen
 	// uses whichever it is. They are interfaces rather than bound methods
 	// because binding a method allocates.
-	lenr      interface{ Len() int }
-	bufr      interface{ Buffered() int }
+	lenr interface{ Len() int }
+	bufr interface{ Buffered() int }
+
+	// budget is how many more elements may be allocated ahead of the data
+	// for them, for this decode. See initLen.
+	budget    int
 	structTag string
 	buf       []byte
 	rec       []byte
@@ -154,6 +158,7 @@ func (d *Decoder) ResetReader(r io.Reader) {
 	// reports how much input is left. Len is exact, and is what Unmarshal
 	// ends up using; Buffered counts only what has been read ahead, so it
 	// is a lower bound, which initLen is still safe to clip against.
+	d.budget = -1
 	d.lenr, d.bufr = nil, nil
 	switch rr := d.r.(type) {
 	case interface{ Len() int }:
@@ -229,6 +234,9 @@ func (d *Decoder) Buffered() io.Reader {
 
 //nolint:gocyclo
 func (d *Decoder) Decode(v interface{}) error {
+	// each value gets its own allowance; see initLen
+	d.budget = -1
+
 	var err error
 	switch v := v.(type) {
 	case *string:
@@ -685,10 +693,10 @@ func (d *Decoder) readN(n int) ([]byte, error) {
 // two ways: to limit, and to as many elements as the input still to come could
 // possibly hold, at minBytesPerElem bytes each.
 //
-// The second clip is what bounds nesting. A limit alone does not: a three-byte
-// array16 header can declare 60k elements, which sits under any useful limit,
-// and a body full of them nests so that every level allocates its own. Sixteen
-// bytes of headers reached 8mb that way.
+// The second clip is what starts to bound nesting. A limit alone does not: a
+// three-byte array16 header can declare 65535 elements, which sits under any
+// useful limit, and a body full of them nests so that every level allocates
+// its own. 192 bytes of headers reached 64mb that way.
 //
 // Clipping is always safe. This is only how much is allocated before the
 // elements arrive; append and map assignment grow to fit however many actually
@@ -700,13 +708,37 @@ func (d *Decoder) initLen(n, limit, minBytesPerElem int) int {
 	if n > limit {
 		n = limit
 	}
-	if avail := d.bytesAvailable(); avail >= 0 {
+
+	avail := d.bytesAvailable()
+	if avail >= 0 {
 		// keep a floor, so that a reader which happens to have little
 		// buffered does not cost every small collection a reallocation
 		if max := max(avail/minBytesPerElem, minInitLen); n > max {
 			n = max
 		}
+
+		// Clipping each collection to the input left still lets nesting
+		// add them up, since every level is clipped against much the
+		// same input as the one above it: 2.4kb of array16 headers
+		// reached 17mb that way, growing with the square of the body.
+		//
+		// So also spend from a budget for the whole decode. Every
+		// element costs at least a byte to encode, so a valid input of
+		// n bytes holds at most n elements however they are arranged,
+		// which makes the input left an allowance that no valid input
+		// can exceed and a nest of headers exhausts immediately. Once
+		// it is spent nothing is allocated ahead of the elements, and
+		// append and map assignment still grow to fit those that do
+		// arrive.
+		if d.budget < 0 {
+			d.budget = max(avail, minInitLen)
+		}
+		if n > d.budget {
+			n = d.budget
+		}
+		d.budget -= n
 	}
+
 	return n
 }
 
