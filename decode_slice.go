@@ -109,7 +109,7 @@ func decodeSliceValue(d *Decoder, v reflect.Value) error {
 
 	for i := 0; i < n; i++ {
 		if !noLimit && i >= v.Len() {
-			v.Set(growSliceValue(v, n, d.initLen(n, sliceAllocLimit, minBytesPerArrayElem)))
+			v.Set(growSliceValue(v, n, max(d.initLen(n, sliceAllocLimit, minBytesPerArrayElem), minInitLen)))
 		}
 
 		elem := v.Index(i)

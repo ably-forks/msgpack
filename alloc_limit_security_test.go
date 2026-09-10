@@ -11,6 +11,8 @@ package msgpack
 // data actually supplied rather than to the count in the header.
 
 import (
+	"bufio"
+	"bytes"
 	"runtime"
 	"strconv"
 	"testing"
@@ -432,4 +434,103 @@ type secNestingCustom struct {
 
 func (c *secNestingCustom) DecodeMsgpack(d *Decoder) error {
 	return d.Decode(&c.values)
+}
+
+// secDecodeNoPanic runs fn and turns a panic into a test failure, so that a
+// decoder that indexes past the slice it has grown fails the test with the
+// panic value rather than taking the whole test binary down.
+func secDecodeNoPanic(t *testing.T, fn func() error) error {
+	t.Helper()
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("decode panicked: %v", r)
+			}
+		}()
+		err = fn()
+	}()
+	return err
+}
+
+// secArrayOfFixints builds an array32 header declaring `declared` elements,
+// followed by `present` positive fixints, so that the header promises more
+// than the body holds.
+func secArrayOfFixints(declared uint32, present int) []byte {
+	data := secArray32Header(declared)
+	for i := 0; i < present; i++ {
+		data = append(data, byte(i%128))
+	}
+	return data
+}
+
+// Test that a typed slice whose header declares more elements than the body
+// holds fails with an error, not a panic.
+//
+// The slice is grown a step at a time towards the declared count, and each
+// step is clipped to the input left and to a budget for the whole decode.
+// Once the body has been consumed both are spent, so a step of zero is asked
+// for, the slice does not grow, and the next element is indexed past its end.
+// The body has to hold at least minInitLen elements to get there: below that
+// the floor sizes the slice past the body and the missing element reads EOF.
+func TestSecOverdeclaredTypedSliceErrorsNotPanics(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		declared uint32
+		present  int
+	}{
+		{"one more than present", 101, 100},
+		{"far more than present", secDeclared, 100},
+		{"one more than present, below the floor", 11, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := secArrayOfFixints(tc.declared, tc.present)
+
+			var dst []int64
+			err := secDecodeNoPanic(t, func() error { return Unmarshal(data, &dst) })
+			if err == nil {
+				t.Fatalf("expected an error for %d declared / %d present, got none (len=%d)",
+					tc.declared, tc.present, len(dst))
+			}
+			t.Logf("%v", err)
+		})
+	}
+}
+
+// Test that a valid typed slice read through a bufio.Reader decodes in full
+// when it holds more elements than the reader had buffered.
+//
+// For a reader without Len, the input left is taken from Buffered, which
+// counts only what has been read ahead and never more than the buffer size.
+// The budget for the decode is set from it once and never refilled, so a body
+// longer than the buffer spends the budget before its last element arrives.
+// This is the shape of a REST publish: a body of a few thousand messages read
+// through a pooled 4kb bufio.Reader.
+func TestSecHonestTypedSliceThroughBufioRoundTrips(t *testing.T) {
+	const bufSize = 4096
+	const n = 3 * bufSize // more elements than the buffer holds bytes
+
+	in := make([]int64, n)
+	for i := range in {
+		in[i] = int64(i)
+	}
+
+	b, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var out []int64
+	dec := NewDecoder(bufio.NewReaderSize(bytes.NewReader(b), bufSize))
+	err = secDecodeNoPanic(t, func() error { return dec.Decode(&out) })
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(out) != n {
+		t.Fatalf("length mismatch: got %d, want %d", len(out), n)
+	}
+	if out[0] != 0 || out[n-1] != int64(n-1) {
+		t.Fatalf("value mismatch: out[0]=%d out[%d]=%d", out[0], n-1, out[n-1])
+	}
 }
