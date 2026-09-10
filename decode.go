@@ -15,9 +15,18 @@ import (
 
 const (
 	bytesAllocLimit = 1 << 20 // 1mb
-	sliceAllocLimit = 1e6     // 1m elements
-	maxMapSize      = 1e6     // 1m elements
+	sliceAllocLimit = 1 << 16 // 64k elements
+	maxMapSize      = 1 << 12 // 4k elements
 )
+
+// The slice and map limits above cap how many elements are allocated up front
+// from a length the stream declares but has not yet supplied. Anything longer
+// still decodes, growing through append and map assignment as the elements
+// arrive, so the limits only have to keep the common case from reallocating.
+//
+// The map limit is the lower of the two because a map entry costs much more
+// memory than a slice element: around 80 bytes once Go has sized its buckets,
+// against 16 bytes for an element of a []interface{}.
 
 const (
 	looseInterfaceDecodingFlag uint32 = 1 << iota
@@ -46,6 +55,14 @@ func GetDecoder() *Decoder {
 func PutDecoder(dec *Decoder) {
 	dec.r = nil
 	dec.s = nil
+
+	// A decode that fails partway keeps the buffer it grew towards the
+	// declared length, so discard an oversized one rather than leave it in
+	// the pool for the next decode to grow further still.
+	if cap(dec.buf) > bytesAllocLimit {
+		dec.buf = nil
+	}
+
 	decPool.Put(dec)
 }
 
@@ -69,11 +86,27 @@ type Decoder struct {
 	r          io.Reader
 	s          io.ByteScanner
 	mapDecoder func(*Decoder) (interface{}, error)
-	structTag  string
-	buf        []byte
-	rec        []byte
-	dict       []string
-	flags      uint32
+
+	// If the reader can report how much input is left, one of these holds
+	// it: a bytes.Reader, bytes.Buffer or strings.Reader through Len, a
+	// bufio.Reader through Buffered. At most one is ever set, and initLen
+	// uses whichever it is. They are interfaces rather than bound methods
+	// because binding a method allocates.
+	lenr interface{ Len() int }
+	bufr interface{ Buffered() int }
+
+	// budget is how many more elements may be allocated ahead of the data
+	// for them, for this decode. See initLen.
+	budget int
+
+	// depth is how many levels of nesting are currently being decoded.
+	// See enter.
+	depth     int
+	structTag string
+	buf       []byte
+	rec       []byte
+	dict      []string
+	flags     uint32
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -123,6 +156,20 @@ func (d *Decoder) ResetReader(r io.Reader) {
 		br := bufio.NewReader(r)
 		d.r = br
 		d.s = br
+	}
+
+	// Work out once, rather than on every collection decoded, which method
+	// reports how much input is left. Len is exact, and is what Unmarshal
+	// ends up using; Buffered counts only what has been read ahead, so it
+	// is a lower bound, which initLen is still safe to clip against.
+	d.budget = -1
+	d.depth = 0
+	d.lenr, d.bufr = nil, nil
+	switch rr := d.r.(type) {
+	case interface{ Len() int }:
+		d.lenr = rr
+	case interface{ Buffered() int }:
+		d.bufr = rr
 	}
 }
 
@@ -192,6 +239,14 @@ func (d *Decoder) Buffered() io.Reader {
 
 //nolint:gocyclo
 func (d *Decoder) Decode(v interface{}) error {
+	// Each value gets its own allowance; see initLen. Only the outermost
+	// decode, though: a CustomDecoder is handed the same Decoder and may
+	// call back into Decode for a field, and refilling there would let a
+	// value nested inside enough of them allocate without limit.
+	if d.depth == 0 {
+		d.budget = -1
+	}
+
 	var err error
 	switch v := v.(type) {
 	case *string:
@@ -321,15 +376,34 @@ func (d *Decoder) DecodeMulti(v ...interface{}) error {
 }
 
 func (d *Decoder) decodeInterfaceCond() (interface{}, error) {
-	if d.flags&looseInterfaceDecodingFlag != 0 {
-		return d.DecodeInterfaceLoose()
+	if err := d.enter(); err != nil {
+		return nil, err
 	}
-	return d.DecodeInterface()
+
+	var (
+		v   interface{}
+		err error
+	)
+	if d.flags&looseInterfaceDecodingFlag != 0 {
+		v, err = d.DecodeInterfaceLoose()
+	} else {
+		v, err = d.DecodeInterface()
+	}
+
+	d.leave()
+	return v, err
 }
 
 func (d *Decoder) DecodeValue(v reflect.Value) error {
+	if err := d.enter(); err != nil {
+		return err
+	}
+
 	decode := getDecoder(v.Type())
-	return decode(d, v)
+	err := decode(d, v)
+
+	d.leave()
+	return err
 }
 
 func (d *Decoder) DecodeNil() error {
@@ -641,6 +715,126 @@ func (d *Decoder) readN(n int) ([]byte, error) {
 	return d.buf, nil
 }
 
+// initLen returns how many elements of a collection to allocate up front,
+// given that the stream has declared n of them.
+//
+// n is declared by the input and not yet backed by any of it, so it is clipped
+// two ways: to limit, and to as many elements as the input still to come could
+// possibly hold, at minBytesPerElem bytes each.
+//
+// The second clip is what starts to bound nesting. A limit alone does not: a
+// three-byte array16 header can declare 65535 elements, which sits under any
+// useful limit, and a body full of them nests so that every level allocates
+// its own. 192 bytes of headers reached 64mb that way.
+//
+// Clipping is always safe. This is only how much is allocated before the
+// elements arrive; append and map assignment grow to fit however many actually
+// do, so a clip that turns out to be low costs a reallocation and nothing else.
+func (d *Decoder) initLen(n, limit, minBytesPerElem int) int {
+	if d.flags&disableAllocLimitFlag != 0 {
+		return n
+	}
+	if n > limit {
+		n = limit
+	}
+
+	avail := d.bytesAvailable()
+	if avail >= 0 {
+		// keep a floor, so that a reader which happens to have little
+		// buffered does not cost every small collection a reallocation
+		if max := max(avail/minBytesPerElem, minInitLen); n > max {
+			n = max
+		}
+
+		// Clipping each collection to the input left still lets nesting
+		// add them up, since every level is clipped against much the
+		// same input as the one above it: 2.4kb of array16 headers
+		// reached 17mb that way, growing with the square of the body.
+		//
+		// So also spend from a budget for the whole decode. Every
+		// element costs at least a byte to encode, so a valid input of
+		// n bytes holds at most n elements however they are arranged,
+		// which makes the input left an allowance that no valid input
+		// can exceed and a nest of headers exhausts immediately. Once
+		// it is spent nothing is allocated ahead of the elements, and
+		// append and map assignment still grow to fit those that do
+		// arrive.
+		if d.budget < 0 {
+			d.budget = max(avail, minInitLen)
+		}
+		if n > d.budget {
+			n = d.budget
+		}
+		d.budget -= n
+	}
+
+	return n
+}
+
+// minInitLen is the smallest collection we will size from the input remaining,
+// below which the clip costs more in reallocation than it saves.
+const minInitLen = 64
+
+// maxDepth is how deeply the input may nest values before decoding gives up.
+//
+// Every level of nesting is a level of recursion, and a container header can
+// be a single byte, so a body of nothing but headers costs a stack frame per
+// byte. At around 512 bytes a frame, 2mb of them exhausts the 1gb a goroutine
+// stack may grow to, which is a fatal error that cannot be recovered.
+//
+// encoding/json stops at the same depth, so input too deeply nested for one
+// format is too deeply nested for the other.
+const maxDepth = 10000
+
+var errNestingTooDeep = fmt.Errorf("msgpack: input nests more than %d levels deep", maxDepth)
+
+// enter records the start of a nested value. If it returns an error the value
+// is too deeply nested to decode and nothing has been recorded, so the caller
+// returns without calling leave; otherwise the caller must call leave once it
+// has finished with the value.
+func (d *Decoder) enter() error {
+	d.depth++
+	if d.depth > maxDepth {
+		d.depth--
+		return errNestingTooDeep
+	}
+	return nil
+}
+
+func (d *Decoder) leave() {
+	d.depth--
+}
+
+// bytesAvailable reports a lower bound on the input still to be read, or -1 if
+// the reader cannot report it at all.
+func (d *Decoder) bytesAvailable() int {
+	if d.lenr != nil {
+		return d.lenr.Len()
+	}
+	if d.bufr != nil {
+		return d.bufr.Buffered()
+	}
+	return -1
+}
+
+// readNInto reads n bytes into b, which it grows or replaces as needed.
+//
+// n comes from a str, bin or ext header, so it is declared by the stream and
+// not yet backed by any data: a five-byte bin32 header can declare 4gb. Unless
+// alloc limits are disabled it therefore grows in bytesAllocLimit steps as the
+// data arrives, rather than allocating the declared length up front, so a
+// header longer than the data that follows costs one step and an error.
+//
+// This is the counterpart of Decoder.readN, which makes the same choice for
+// the decoder's own scratch buffer, and exists because the value read here is
+// returned to the caller and so cannot share that buffer.
+func (d *Decoder) readNInto(b []byte, n int) ([]byte, error) {
+	if d.flags&disableAllocLimitFlag != 0 {
+		return readN(d.r, b, n)
+	}
+	return readNGrow(d.r, b, n)
+}
+
 func readN(r io.Reader, b []byte, n int) ([]byte, error) {
 	if b == nil {
 		if n == 0 {
@@ -702,6 +896,13 @@ func readNGrow(r io.Reader, b []byte, n int) ([]byte, error) {
 
 func min(a, b int) int { //nolint:unparam
 	if a <= b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b

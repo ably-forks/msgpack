@@ -115,8 +115,15 @@ func (f *field) EncodeValue(e *Encoder, strct reflect.Value) error {
 }
 
 func (f *field) DecodeValue(d *Decoder, strct reflect.Value) error {
+	if err := d.enter(); err != nil {
+		return err
+	}
+
 	v := fieldByIndexAlloc(strct, f.index)
-	return f.decoder(d, v)
+	err := f.decoder(d, v)
+
+	d.leave()
+	return err
 }
 
 //------------------------------------------------------------------------------

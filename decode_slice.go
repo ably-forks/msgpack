@@ -49,7 +49,7 @@ func (d *Decoder) decodeStringSlicePtr(ptr *[]string) error {
 		return nil
 	}
 
-	ss := makeStrings(*ptr, n, d.flags&disableAllocLimitFlag != 0)
+	ss := makeStrings(*ptr, d.initLen(n, sliceAllocLimit, minBytesPerArrayElem))
 	for i := 0; i < n; i++ {
 		s, err := d.DecodeString()
 		if err != nil {
@@ -62,11 +62,11 @@ func (d *Decoder) decodeStringSlicePtr(ptr *[]string) error {
 	return nil
 }
 
-func makeStrings(s []string, n int, noLimit bool) []string {
-	if !noLimit && n > sliceAllocLimit {
-		n = sliceAllocLimit
-	}
+// minBytesPerArrayElem is the least an array element can cost to encode: a
+// one-byte fixint, nil or bool.
+const minBytesPerArrayElem = 1
 
+func makeStrings(s []string, n int) []string {
 	if s == nil {
 		return make([]string, 0, n)
 	}
@@ -101,15 +101,15 @@ func decodeSliceValue(d *Decoder, v reflect.Value) error {
 		v.Set(v.Slice(0, v.Cap()))
 	}
 
-	noLimit := d.flags&disableAllocLimitFlag != 1
+	noLimit := d.flags&disableAllocLimitFlag != 0
 
 	if noLimit && n > v.Len() {
-		v.Set(growSliceValue(v, n, noLimit))
+		v.Set(growSliceValue(v, n, d.initLen(n, sliceAllocLimit, minBytesPerArrayElem)))
 	}
 
 	for i := 0; i < n; i++ {
 		if !noLimit && i >= v.Len() {
-			v.Set(growSliceValue(v, n, noLimit))
+			v.Set(growSliceValue(v, n, d.initLen(n, sliceAllocLimit, minBytesPerArrayElem)))
 		}
 
 		elem := v.Index(i)
@@ -121,13 +121,16 @@ func decodeSliceValue(d *Decoder, v reflect.Value) error {
 	return nil
 }
 
-func growSliceValue(v reflect.Value, n int, noLimit bool) reflect.Value {
-	diff := n - v.Len()
-	if !noLimit && diff > sliceAllocLimit {
-		diff = sliceAllocLimit
-	}
-	v = reflect.AppendSlice(v, reflect.MakeSlice(v.Type(), diff, diff))
-	return v
+// growSliceValue grows v towards n elements, by at most maxStep at a time, so
+// that a declared n far larger than the data behind it is never allocated in
+// one go. The caller loops until v is long enough for the elements that
+// actually arrive, and indexes what it grew, so v must always gain at least
+// one element however small a step it was given. The floor is minInitLen
+// rather than one element to avoid a reallocation per element; growing past
+// the elements n declares is still ruled out.
+func growSliceValue(v reflect.Value, n, maxStep int) reflect.Value {
+	diff := min(max(maxStep, minInitLen), n-v.Len())
+	return reflect.AppendSlice(v, reflect.MakeSlice(v.Type(), diff, diff))
 }
 
 func decodeArrayValue(d *Decoder, v reflect.Value) error {
@@ -170,7 +173,9 @@ func (d *Decoder) decodeSlice(c byte) ([]interface{}, error) {
 		return nil, nil
 	}
 
-	s := make([]interface{}, 0, n)
+	// Never pre-allocate based on the untrusted, declared element count.
+	// append still grows to fit the data actually present.
+	s := make([]interface{}, 0, d.initLen(n, sliceAllocLimit, minBytesPerArrayElem))
 	for i := 0; i < n; i++ {
 		v, err := d.decodeInterfaceCond()
 		if err != nil {

@@ -35,11 +35,7 @@ func decodeMapValue(d *Decoder, v reflect.Value) error {
 	}
 
 	if v.IsNil() {
-		ln := n
-		if d.flags&disableAllocLimitFlag == 0 {
-			ln = min(ln, maxMapSize)
-		}
-		v.Set(reflect.MakeMapWithSize(typ, ln))
+		v.Set(reflect.MakeMapWithSize(typ, d.initLen(n, maxMapSize, minBytesPerMapEntry)))
 	}
 	if n == 0 {
 		return nil
@@ -54,6 +50,10 @@ func (d *Decoder) decodeMapDefault() (interface{}, error) {
 	}
 	return d.DecodeMap()
 }
+
+// minBytesPerMapEntry is the least a map entry can cost to encode: an empty
+// fixstr key and a one-byte value.
+const minBytesPerMapEntry = 2
 
 // DecodeMapLen decodes map length. Length is -1 when map is nil.
 func (d *Decoder) DecodeMapLen() (int, error) {
@@ -110,11 +110,7 @@ func (d *Decoder) decodeMapStringStringPtr(ptr *map[string]string) error {
 
 	m := *ptr
 	if m == nil {
-		ln := size
-		if d.flags&disableAllocLimitFlag == 0 {
-			ln = min(size, maxMapSize)
-		}
-		*ptr = make(map[string]string, ln)
+		*ptr = make(map[string]string, d.initLen(size, maxMapSize, minBytesPerMapEntry))
 		m = *ptr
 	}
 
@@ -157,7 +153,7 @@ func (d *Decoder) DecodeMap() (map[string]interface{}, error) {
 		return nil, nil
 	}
 
-	m := make(map[string]interface{}, n)
+	m := make(map[string]interface{}, d.initLen(n, maxMapSize, minBytesPerMapEntry))
 
 	for i := 0; i < n; i++ {
 		mk, err := d.DecodeString()
@@ -184,7 +180,7 @@ func (d *Decoder) DecodeUntypedMap() (map[interface{}]interface{}, error) {
 		return nil, nil
 	}
 
-	m := make(map[interface{}]interface{}, n)
+	m := make(map[interface{}]interface{}, d.initLen(n, maxMapSize, minBytesPerMapEntry))
 
 	for i := 0; i < n; i++ {
 		mk, err := d.decodeInterfaceCond()
@@ -233,12 +229,7 @@ func (d *Decoder) DecodeTypedMap() (interface{}, error) {
 
 	mapType := reflect.MapOf(keyType, valueType)
 
-	ln := n
-	if d.flags&disableAllocLimitFlag == 0 {
-		ln = min(ln, maxMapSize)
-	}
-
-	mapValue := reflect.MakeMapWithSize(mapType, ln)
+	mapValue := reflect.MakeMapWithSize(mapType, d.initLen(n, maxMapSize, minBytesPerMapEntry))
 	mapValue.SetMapIndex(reflect.ValueOf(key), reflect.ValueOf(value))
 
 	n--
