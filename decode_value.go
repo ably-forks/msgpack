@@ -182,7 +182,15 @@ func decodeInterfaceValue(d *Decoder, v reflect.Value) error {
 	if v.IsNil() {
 		return d.interfaceValue(v)
 	}
-	return d.DecodeValue(v.Elem())
+	// Only a non-nil pointer held by the interface can be decoded into in
+	// place. Any other value it holds is not addressable, so decoding into it
+	// panics; replace it instead, as encoding/json does. A nil replaces a
+	// pointer too, since the pointer itself cannot be set to nil.
+	if elem := v.Elem(); elem.Kind() == reflect.Ptr && !elem.IsNil() && !d.hasNilCode() {
+		return d.DecodeValue(elem)
+	}
+	v.Set(reflect.Zero(v.Type()))
+	return d.interfaceValue(v)
 }
 
 func (d *Decoder) interfaceValue(v reflect.Value) error {

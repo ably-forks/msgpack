@@ -356,6 +356,11 @@ func (d *Decoder) Decode(v interface{}) error {
 	vv = vv.Elem()
 	if vv.Kind() == reflect.Interface {
 		if !vv.IsNil() {
+			// A nil clears the interface itself; the value it holds is not
+			// addressable, so decoding a nil into that would panic.
+			if d.hasNilCode() {
+				return d.decodeNilValue(vv)
+			}
 			vv = vv.Elem()
 			if vv.Kind() != reflect.Ptr {
 				return fmt.Errorf("msgpack: Decode(non-pointer %s)", vv.Type().String())

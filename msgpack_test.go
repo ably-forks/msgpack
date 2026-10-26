@@ -369,6 +369,77 @@ func TestInterface(t *testing.T) {
 	require.Equal(t, "foo", str)
 }
 
+// A map that repeats a key decodes the key twice into the same field, so the
+// second decode finds the interface already holding the first value.
+func TestInterfaceDuplicateKey(t *testing.T) {
+	type Interface struct {
+		Foo interface{}
+	}
+
+	encode := func(first, second interface{}) []byte {
+		var buf bytes.Buffer
+		enc := msgpack.NewEncoder(&buf)
+		require.Nil(t, enc.EncodeMapLen(2))
+		for _, v := range []interface{}{first, second} {
+			require.Nil(t, enc.EncodeString("Foo"))
+			require.Nil(t, enc.Encode(v))
+		}
+		return buf.Bytes()
+	}
+
+	tests := []struct {
+		name          string
+		first, second interface{}
+		want          interface{}
+	}{
+		{"string then string", "a", "b", "b"},
+		{"string then int", "a", int8(1), int8(1)},
+		{"int then string", int8(1), "b", "b"},
+		{"string then nil", "a", nil, nil},
+		{"string then map", "a", map[string]interface{}{"k": "v"}, map[string]interface{}{"k": "v"}},
+		{"map then string", map[string]interface{}{"k": "v"}, "b", "b"},
+		{"slice then slice", []interface{}{"a"}, []interface{}{"b"}, []interface{}{"b"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var out Interface
+			err := msgpack.Unmarshal(encode(test.first, test.second), &out)
+			require.Nil(t, err)
+			require.Equal(t, test.want, out.Foo)
+		})
+	}
+}
+
+func TestInterfaceHoldingPointerDecodesNil(t *testing.T) {
+	type Interface struct {
+		Foo interface{}
+	}
+
+	b, err := msgpack.Marshal(Interface{})
+	require.Nil(t, err)
+
+	str := "foo"
+	out := Interface{Foo: &str}
+	err = msgpack.Unmarshal(b, &out)
+	require.Nil(t, err)
+	require.Nil(t, out.Foo)
+	require.Equal(t, "foo", str)
+}
+
+func TestTopLevelInterfaceDecodesNil(t *testing.T) {
+	b, err := msgpack.Marshal(nil)
+	require.Nil(t, err)
+
+	str := "foo"
+	for _, previous := range []interface{}{&str, "foo"} {
+		out := previous
+		err := msgpack.Unmarshal(b, &out)
+		require.Nil(t, err)
+		require.Nil(t, out)
+	}
+	require.Equal(t, "foo", str)
+}
+
 func TestNaN(t *testing.T) {
 	in := float64(math.NaN())
 	b, err := msgpack.Marshal(in)
