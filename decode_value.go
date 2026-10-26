@@ -182,12 +182,24 @@ func decodeInterfaceValue(d *Decoder, v reflect.Value) error {
 	if v.IsNil() {
 		return d.interfaceValue(v)
 	}
-	// Only a non-nil pointer held by the interface can be decoded into in
-	// place. Any other value it holds is not addressable, so decoding into it
-	// panics; replace it instead, as encoding/json does. A nil replaces a
-	// pointer too, since the pointer itself cannot be set to nil.
-	if elem := v.Elem(); elem.Kind() == reflect.Ptr && !elem.IsNil() && !d.hasNilCode() {
+	// The value held by the interface is not addressable, so decoding into it
+	// directly panics. A non-nil pointer can still be decoded through, and a
+	// non-nil map shares its entries with any copy of it, so a map decodes
+	// into an addressable copy that is then stored back, filling the held map
+	// and keeping its type. Anything else is replaced, as encoding/json does.
+	// A nil replaces a pointer too, since the pointer itself cannot be set.
+	elem := v.Elem()
+	switch {
+	case elem.Kind() == reflect.Ptr && !elem.IsNil() && !d.hasNilCode():
 		return d.DecodeValue(elem)
+	case elem.Kind() == reflect.Map && !elem.IsNil() && d.hasMapCode():
+		m := reflect.New(elem.Type()).Elem()
+		m.Set(elem)
+		if err := d.DecodeValue(m); err != nil {
+			return err
+		}
+		v.Set(m)
+		return nil
 	}
 	v.Set(reflect.Zero(v.Type()))
 	return d.interfaceValue(v)

@@ -681,6 +681,11 @@ func (d *Decoder) hasNilCode() bool {
 	return err == nil && code == msgpcode.Nil
 }
 
+func (d *Decoder) hasMapCode() bool {
+	code, err := d.PeekCode()
+	return err == nil && (msgpcode.IsFixedMap(code) || code == msgpcode.Map16 || code == msgpcode.Map32)
+}
+
 func (d *Decoder) readCode() (byte, error) {
 	c, err := d.s.ReadByte()
 	if err != nil {

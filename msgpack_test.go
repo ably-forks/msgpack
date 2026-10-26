@@ -398,12 +398,45 @@ func TestInterfaceDuplicateKey(t *testing.T) {
 		{"string then nil", "a", nil, nil},
 		{"string then map", "a", map[string]interface{}{"k": "v"}, map[string]interface{}{"k": "v"}},
 		{"map then string", map[string]interface{}{"k": "v"}, "b", "b"},
+		{"map then nil", map[string]interface{}{"k": "v"}, nil, nil},
+		{"map then map", map[string]interface{}{"k": "v"}, map[string]interface{}{"k2": "v2"}, map[string]interface{}{"k2": "v2"}},
 		{"slice then slice", []interface{}{"a"}, []interface{}{"b"}, []interface{}{"b"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var out Interface
 			err := msgpack.Unmarshal(encode(test.first, test.second), &out)
+			require.Nil(t, err)
+			require.Equal(t, test.want, out.Foo)
+		})
+	}
+}
+
+// A map held by an interface decides the type a map is decoded as, and is
+// filled in place, while input that is not a map replaces it.
+func TestInterfaceHoldingMap(t *testing.T) {
+	type Interface struct {
+		Foo interface{}
+	}
+
+	tests := []struct {
+		name string
+		held interface{}
+		in   interface{}
+		want interface{}
+	}{
+		{"typed map", map[string]int{"old": 1}, map[string]int{"new": 2}, map[string]int{"old": 1, "new": 2}},
+		{"string map", map[string]string{"old": "a"}, map[string]string{"new": "b"}, map[string]string{"old": "a", "new": "b"}},
+		{"non-map input", map[string]int{"old": 1}, "b", "b"},
+		{"nil input", map[string]int{"old": 1}, nil, nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			b, err := msgpack.Marshal(Interface{Foo: test.in})
+			require.Nil(t, err)
+
+			out := Interface{Foo: test.held}
+			err = msgpack.Unmarshal(b, &out)
 			require.Nil(t, err)
 			require.Equal(t, test.want, out.Foo)
 		})
